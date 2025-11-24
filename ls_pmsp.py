@@ -2,6 +2,8 @@ import copy
 import json
 import argparse
 import time
+import os
+import csv
 
 
 # --- 1. CARREGAMENTO E PREPARAÇÃO DOS DADOS ---
@@ -239,61 +241,101 @@ def local_search(initial_sequences, config, processing_times, setup_matrix, rele
 
     return current_solution, current_makespan, iteration
 
-
-
-
 # --- 5. CACULANDO O LIMITE INFERIOR DDLB ---
-def calcular_ddlb(config, processing_times, setup_matrix, release_dates):
+def calcular_ddlb(config, processing_times, setup_matrix, ready_times):
     """
-    Calcula o Data Dependent Lower Bound (DDLB) corrigido,
-    consistente com o modelo SEM teardown final e com a estrutura
-    de dados deste arquivo (dicionários 1..n).
-
-    Ideia (mesma do GA, só adaptada para dicionário):
-    - Para cada job i, δ_i = menor setup saindo de i para qualquer j != i (entre jobs reais).
-    - Em qualquer agenda com m máquinas, n_jobs - m jobs pagarão setup de saída.
-    - Setup total mínimo = sum(δ_i) - soma dos m maiores δ_i.
-    - Limite de carga = (sum p_i + setup_total_min) / m
-    - Limite de caminho crítico = max_i (r_i + p_i + δ_i)
-    - DDLB = max(limite_carga_trabalho, limite_caminho_critico)
+    Calcula o DDLB em um modelo compatível com o ls_pmsp.py:
+    - jobs indexados de 1..n_jobs (dicionários)
+    - NÃO considera teardown (job fictício n+1)
+    - caminho crítico = max_i (r_i + p_i)
     """
     n_jobs = config['n_jobs']
     n_machines = config['n_maquinas']
 
-    # 1) Calcula δ_i = menor setup saindo de i (somente entre jobs reais 1..n)
+    # Conjunto de IDs de jobs reais (ignorando a linha '0' da matriz de setup)
+    job_ids = list(range(1, n_jobs + 1))
+
+    # 1) δ_i = menor setup saindo de i (para outros jobs reais)
     deltas = {}
-    for i in range(1, n_jobs + 1):
+    for i in job_ids:
         min_setup_i = min(
             setup_matrix[i][j]
-            for j in range(1, n_jobs + 1)
+            for j in job_ids
             if j != i
         )
         deltas[i] = min_setup_i
 
-    # 2) Soma dos tempos de processamento e dos δ_i
-    soma_p = sum(processing_times[i] for i in range(1, n_jobs + 1))
-    soma_deltas = sum(deltas[i] for i in range(1, n_jobs + 1))
+    # 2) soma dos p_i e δ_i
+    soma_p = sum(processing_times[i] for i in job_ids)
+    soma_deltas = sum(deltas[i] for i in job_ids)
 
-    # 3) Setup total mínimo: tira os m maiores δ_i
+    # 3) setup total mínimo (tirando os m maiores δ_i, que podem ser "não pagos"
+    #    pelos últimos jobs de cada máquina)
     deltas_ordenados = sorted(deltas.values(), reverse=True)
     soma_maiores = sum(deltas_ordenados[:n_machines])
     setup_total_minimo = soma_deltas - soma_maiores
 
     limite_carga_trabalho = (soma_p + setup_total_minimo) / n_machines
 
-    # 4) Limite de caminho crítico: max_i (r_i + p_i + δ_i)
+    # 4) Limite de caminho crítico *sem* δ_i
     limite_caminho_critico = 0.0
-    for i in range(1, n_jobs + 1):
-        caminho_i = release_dates[i] + processing_times[i] + deltas[i]
+    for i in job_ids:
+        caminho_i = ready_times[i] + processing_times[i]  # r_i + p_i
         if caminho_i > limite_caminho_critico:
             limite_caminho_critico = caminho_i
 
     ddlb = max(limite_carga_trabalho, limite_caminho_critico)
     return ddlb
 
+# --- 6. SALVA RESULTADO CSV ---
+def format_decimal(valor: float, casas: int = 2) -> str:
+            """
+            Formata um número com 'casas' decimais usando vírgula como separador.
+            Ex: 1234.567 -> "1234,57"
+            """
+            return f"{valor:.{casas}f}".replace('.', ',')
 
-# --- 3. ORQUESTRAÇÃO E EXECUÇÃO PRINCIPAL ---
+def salvar_resultado_csv(
+    csv_file: str,
+    scenario_code: str,
+    instance_path: str,
+    ms_final: float,
+    ddlb: float,
+    razao_ms_ddlb: float,
+    melhoria_ms: float,
+    q_iteracoes: int,
+    tempo_ga_ms: float,
+):
+    file_exists = os.path.isfile(csv_file)
 
+    with open(csv_file, mode="a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f, delimiter=';')  # ; como separador de campos (padrão PT-BR)
+
+        if not file_exists:
+            writer.writerow([
+                "cenario",
+                "arquivo_instancia",
+                "makespan_final",
+                "ddlb",
+                "razao_ms_ddlb",
+                "melhoria_ms",
+                "iteracoes",
+                "tempo_ga_ms",
+            ])
+
+        writer.writerow([
+            scenario_code,
+            instance_path,
+            format_decimal(ms_final, 2),
+            format_decimal(ddlb, 2),
+            format_decimal(razao_ms_ddlb, 4),
+            format_decimal(melhoria_ms, 2),
+            q_iteracoes,
+            format_decimal(tempo_ga_ms, 2),
+        ])
+
+
+# --- 7. ORQUESTRAÇÃO E EXECUÇÃO PRINCIPAL ---
 def run_scenario_from_file(file_path):
     """Orquestra o processo: carregar, resolver e exibir resultados para um arquivo."""
     print("="*50)
@@ -339,6 +381,9 @@ def run_scenario_from_file(file_path):
     # Exibir Resultado Final
     final_times = {m_id: calculate_sequence_time(seq, proc_times, setup_mat, release_dts) for m_id, seq in final_solution.items()}
     
+    scenario_code = config.get('codigo_cenario', 'Cenário Desconhecido')
+    melhoria_ms = makespan_initial - final_makespan
+
     print("\n" + "="*50)
     print(f"RESULTADO FINAL PARA {config.get('codigo_cenario', 'Cenário Desconhecido')}")
     print("="*50)
@@ -355,6 +400,20 @@ def run_scenario_from_file(file_path):
     print(f"Quantidade de iterações realizadas: {total_iteracoes}")
     print(f"Tempo de execução da busca local: {tempo_busca_local*1000:.2f} ms")
     print("\n")
+
+    # --- Salvar resultados em CSV ---
+    salvar_resultado_csv(
+        csv_file="ls_pmsp.csv",
+        scenario_code= scenario_code,
+        instance_path=file_path,
+        ms_final=final_makespan,
+        ddlb=ddlb,
+        razao_ms_ddlb=ratio_ms_ddlb,
+        melhoria_ms=melhoria_ms,
+        q_iteracoes=total_iteracoes,
+        tempo_ga_ms=tempo_busca_local*1000.0,
+    )
+
 
 if __name__ == "__main__":
     # Configura o parser de argumentos para receber o caminho do arquivo
